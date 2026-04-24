@@ -1,8 +1,29 @@
 # tcpfan
 
-One-to-many TCP relay implementations and a unified benchmark harness.
+`tcpfan` is a one-to-many TCP relay.
 
-This repository contains four relay variants exposed through `bin/`:
+It accepts:
+- one active **source** TCP connection
+- many **sink** TCP connections
+
+Then it forwards source bytes to all sinks, unchanged.
+
+## What The Tool Does
+
+At runtime, each implementation behaves like this:
+
+- listen on a source port and a sink port
+- allow only one source at a time
+- fan out source byte stream to all connected sinks
+- ignore/discard sink-to-relay traffic (no reverse forwarding)
+- keep per-sink memory bounded
+- drop sinks that cannot keep up (instead of stalling the whole relay)
+
+This is a byte-stream relay, not an application proxy. It does not parse protocols, replay history, or do TLS termination.
+
+## Implementations
+
+This repository contains four relay variants, exposed via `bin/` symlinks:
 
 - `tcpfan-claude-c`
 - `tcpfan-claude-zig`

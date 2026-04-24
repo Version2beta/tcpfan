@@ -283,6 +283,12 @@ const Relay = struct {
     src_fd: c_int = -1,
 
     sinks: []Sink,
+    // Packed list of active slot indices. pollfds[3..3+n_active] are laid out
+    // in `active` order so poll()'s `nfds` stays at 3+n_active instead of
+    // 3+max_sinks — required on macOS where poll() returns EINVAL when nfds
+    // exceeds the soft RLIMIT_NOFILE, even for entries with fd=-1.
+    active: []u32,
+    n_active: u32 = 0,
     pollfds: []posix.pollfd,
     read_buf: []u8,
     cur_read: u32,
@@ -302,6 +308,7 @@ const Relay = struct {
         // pollfds layout: [0]=src listener, [1]=snk listener, [2]=src conn, [3..]=sinks.
         const sinks = cAlloc(Sink, cfg.max_sinks) orelse return error.OutOfMemory;
         for (sinks) |*s| s.* = .{};
+        const active = cAlloc(u32, cfg.max_sinks) orelse return error.OutOfMemory;
         const pollfds = cAlloc(posix.pollfd, 3 + cfg.max_sinks) orelse return error.OutOfMemory;
         for (pollfds) |*p| p.* = .{ .fd = -1, .events = 0, .revents = 0 };
         const read_buf = cAlloc(u8, cfg.read_max) orelse return error.OutOfMemory;
@@ -321,6 +328,7 @@ const Relay = struct {
             .src_listener = src_listener,
             .snk_listener = snk_listener,
             .sinks = sinks,
+            .active = active,
             .pollfds = pollfds,
             .read_buf = read_buf,
             .cur_read = cfg.read_default,
@@ -336,7 +344,7 @@ const Relay = struct {
             if (s.buf.len > 0) c.free(s.buf.ptr);
         }
         _ = c.close(self.src_listener); _ = c.close(self.snk_listener);
-        c.free(self.sinks.ptr); c.free(self.pollfds.ptr); c.free(self.read_buf.ptr);
+        c.free(self.sinks.ptr); c.free(self.active.ptr); c.free(self.pollfds.ptr); c.free(self.read_buf.ptr);
     }
 
     // ---- Sink lifecycle ----
@@ -363,15 +371,22 @@ const Relay = struct {
         setSockBuf(fd, c.SO.SNDBUF, @intCast(self.cfg.sink_buf));
         setSockBuf(fd, c.SO.RCVBUF, 4096);
         self.sinks[slot] = .{ .fd = fd, .buf = buf };
+        self.active[self.n_active] = @intCast(slot);
+        self.n_active += 1;
         self.sinks_accepted += 1;
         logf(.normal, "sink connect slot={}", .{slot});
     }
 
-    fn dropSink(self: *Relay, slot: usize, reason: DropReason) void {
+    /// Close sink at active-list index `ai` and swap-remove from `active`.
+    /// Callers iterate `active[0..n_active]` in reverse so swap-remove is safe.
+    fn dropSink(self: *Relay, ai: usize, reason: DropReason) void {
+        const slot = self.active[ai];
         const s = &self.sinks[slot];
         if (s.fd < 0) return;
         _ = c.close(s.fd);
         s.fd = -1; s.head = 0; s.len = 0;
+        self.n_active -= 1;
+        self.active[ai] = self.active[self.n_active];
         const counter = switch (reason) {
             .peer_closed => &self.drops_peer,
             .overflow    => &self.drops_overflow,
@@ -399,11 +414,15 @@ const Relay = struct {
             self.src_fd = -1;
         }
         // Default: close all sinks at session end. Best-effort blocking flush
-        // first so committed bytes reach the receiver before our FIN.
-        for (self.sinks, 0..) |*s, i| {
+        // first so committed bytes reach the receiver before our FIN. Reverse
+        // walk so dropSink's swap-remove doesn't skip entries.
+        var ai: usize = self.n_active;
+        while (ai > 0) {
+            ai -= 1;
+            const s = &self.sinks[self.active[ai]];
             if (s.fd < 0) continue;
             self.flushSinkBlocking(s);
-            self.dropSink(i, .peer_closed);
+            self.dropSink(ai, .peer_closed);
         }
         logf(.normal, "session end in={} out={}", .{ self.total_in, self.total_out });
     }
@@ -466,9 +485,15 @@ const Relay = struct {
             else
                 POLL_TIMEOUT_MS;
 
-            const pr = c.poll(self.pollfds.ptr, @intCast(self.pollfds.len), timeout);
+            // nfds is 3 + n_active, not 3 + max_sinks: macOS poll() rejects
+            // nfds greater than the soft RLIMIT_NOFILE with EINVAL even if
+            // most entries are fd=-1, which would silently kill the loop.
+            const nfds: u32 = 3 + self.n_active;
+            const pr = c.poll(self.pollfds.ptr, @intCast(nfds), timeout);
             if (pr < 0) {
-                if (c.errno(pr) == .INTR) continue;
+                const e = c.errno(pr);
+                if (e == .INTR) continue;
+                logf(.normal, "poll error errno={}", .{@intFromEnum(e)});
                 break;
             }
 
@@ -496,17 +521,20 @@ const Relay = struct {
         if (self.src_fd >= 0) self.endSession();
     }
 
-    /// Refresh pollfds for source + sink slots only. Listener slots are
+    /// Refresh pollfds for source + active sinks. Listener slots are
     /// initialized once in `init` and only their `revents` is reset here.
+    /// Layout is packed — pollfds[3..3+n_active] mirrors active[0..n_active].
     fn preparePollSet(self: *Relay) void {
         self.pollfds[0].revents = 0;
         self.pollfds[1].revents = 0;
         // Source: never throttled (spec 4.4: drop slow sinks, not source).
         const src_up = self.src_fd >= 0;
         self.pollfds[2] = .{ .fd = if (src_up) self.src_fd else -1, .events = if (src_up) c.POLL.IN else 0, .revents = 0 };
-        for (self.sinks, 0..) |*s, i| {
-            const ev: i16 = if (s.fd < 0) 0 else c.POLL.IN | (if (s.len > 0) @as(i16, c.POLL.OUT) else 0);
-            self.pollfds[3 + i] = .{ .fd = s.fd, .events = ev, .revents = 0 };
+        var ai: usize = 0;
+        while (ai < self.n_active) : (ai += 1) {
+            const s = &self.sinks[self.active[ai]];
+            const ev: i16 = c.POLL.IN | (if (s.len > 0) @as(i16, c.POLL.OUT) else 0);
+            self.pollfds[3 + ai] = .{ .fd = s.fd, .events = ev, .revents = 0 };
         }
     }
 
@@ -530,9 +558,14 @@ const Relay = struct {
     }
 
     fn serviceSinks(self: *Relay) void {
-        for (self.sinks, 0..) |*s, i| {
-            if (s.fd < 0) continue;
-            const r = self.pollfds[3 + i].revents;
+        // Reverse walk so dropSink's swap-remove pulls an already-processed
+        // entry into the current index; the next iteration's ai-1 is
+        // untouched.
+        var ai: usize = self.n_active;
+        while (ai > 0) {
+            ai -= 1;
+            const s = &self.sinks[self.active[ai]];
+            const r = self.pollfds[3 + ai].revents;
 
             // Reverse traffic: read & discard. Cap at one read per tick — a
             // long loop here lets a chatty sink (e.g., `nc -z` probe) starve
@@ -543,12 +576,12 @@ const Relay = struct {
                 if (n > 0) {
                     self.rev_dropped += @intCast(n);
                 } else if (n == 0) {
-                    self.dropSink(i, .peer_closed);
+                    self.dropSink(ai, .peer_closed);
                     continue;
                 } else {
                     const e = c.errno(n);
                     if (e != .AGAIN and e != .INTR) {
-                        self.dropSink(i, .write_error);
+                        self.dropSink(ai, .write_error);
                         continue;
                     }
                 }
@@ -557,7 +590,7 @@ const Relay = struct {
             // Write side.
             if ((r & c.POLL.OUT) != 0 or s.len > 0) {
                 if (s.drain()) {
-                    self.dropSink(i, .write_error);
+                    self.dropSink(ai, .write_error);
                     continue;
                 }
             }
@@ -566,7 +599,7 @@ const Relay = struct {
             // whether the ring is empty: the peer is gone, more sends will
             // fail, and pending bytes won't be delivered anyway.
             if ((r & (c.POLL.HUP | c.POLL.ERR | c.POLL.NVAL)) != 0)
-                self.dropSink(i, .peer_closed);
+                self.dropSink(ai, .peer_closed);
         }
     }
 
@@ -582,8 +615,11 @@ const Relay = struct {
             last_read = nbytes;
             const data = self.read_buf[0..nbytes];
 
-            for (self.sinks, 0..) |*s, i| {
-                if (s.fd < 0) continue;
+            // Reverse walk so dropSink's swap-remove doesn't skip entries.
+            var ai: usize = self.n_active;
+            while (ai > 0) {
+                ai -= 1;
+                const s = &self.sinks[self.active[ai]];
                 var off: usize = 0;
                 // Empty-ring fast path: try to push directly to the kernel
                 // with no memcpy. On loopback with healthy receivers the
@@ -597,13 +633,13 @@ const Relay = struct {
                         self.total_out += off;
                     } else if (sent == 0) {
                         any_drop = true;
-                        self.dropSink(i, .peer_closed);
+                        self.dropSink(ai, .peer_closed);
                         continue;
                     } else {
                         const e = c.errno(sent);
                         if (e != .AGAIN and e != .INTR) {
                             any_drop = true;
-                            self.dropSink(i, .write_error);
+                            self.dropSink(ai, .write_error);
                             continue;
                         }
                     }
@@ -614,7 +650,7 @@ const Relay = struct {
                     // socket is full). Enqueue the leftover; POLLOUT drains.
                     if (!s.enqueue(data[off..])) {
                         any_drop = true;
-                        self.dropSink(i, .overflow);
+                        self.dropSink(ai, .overflow);
                         continue;
                     }
                     self.total_out += data.len - off;
@@ -626,7 +662,7 @@ const Relay = struct {
                     // C's sink_flush after ring_push.
                     if (s.drain()) {
                         any_drop = true;
-                        self.dropSink(i, .write_error);
+                        self.dropSink(ai, .write_error);
                     }
                 }
             }
@@ -646,8 +682,10 @@ const Relay = struct {
         // tail that drains on the next poll round-trip is normal at line rate
         // and isn't worth shrinking for (causes oscillation).
         var heavy_backlog = false;
-        for (self.sinks) |*s| {
-            if (s.fd >= 0 and s.len > s.buf.len / 2) { heavy_backlog = true; break; }
+        var bi: usize = 0;
+        while (bi < self.n_active) : (bi += 1) {
+            const s = &self.sinks[self.active[bi]];
+            if (s.len > s.buf.len / 2) { heavy_backlog = true; break; }
         }
         self.adapt(last_read, heavy_backlog, any_drop);
     }
@@ -658,16 +696,13 @@ const Relay = struct {
         if (now - self.last_stats_ms < self.cfg.stats_interval_ms) return;
         self.last_stats_ms = now;
 
-        var sink_count: u32 = 0;
         var pending_total: u64 = 0;
-        for (self.sinks) |*s| {
-            if (s.fd >= 0) {
-                sink_count += 1;
-                pending_total += s.len;
-            }
+        var ai: usize = 0;
+        while (ai < self.n_active) : (ai += 1) {
+            pending_total += self.sinks[self.active[ai]].len;
         }
         logf(.normal, "stats active={} sinks={} in={} out={} pending={} drops_overflow={} drops_error={} drops_peer={} rev_dropped={} read_size={}", .{
-            self.src_fd >= 0, sink_count,
+            self.src_fd >= 0, self.n_active,
             self.total_in, self.total_out, pending_total,
             self.drops_overflow, self.drops_error, self.drops_peer,
             self.rev_dropped, self.cur_read,

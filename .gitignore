@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Zig build/cache outputs
+**/.zig-cache/
+**/zig-out/
+
+# C/C++ build outputs
+*.o
+*.a
+*.so
+*.dylib
+
+# Relay/build binaries produced locally
+claude/c/tcpfan
+codex/c/relay
+benchmark/source_writer
+benchmark/sink_reader
+claude/bench/source_writer
+claude/bench/sink_reader
+claude/bench/latency_source
+claude/bench/latency_sink
+codex/bench/source_writer
+codex/bench/sink_reader
+
+# Benchmark and run artifacts
+**/results/
+benchmark/results/
+
+# Misc local locks/state
+**/.claude/

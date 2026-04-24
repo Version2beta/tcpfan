@@ -23,7 +23,7 @@ Aggregated report:
 - Per-scenario averages and variability
 - Failure counts per implementation
 
-## Run
+## Throughput-Max Run
 
 ```bash
 cd /Users/rob/Development/tcpfan
@@ -37,11 +37,29 @@ Outputs:
 - `benchmark/results/benchmark_summary.json`
 - `benchmark/results/raw/*.log`
 
+## Paced Ramp Run (10 Mbit/s Under-Run Detection)
+
+```bash
+cd /Users/rob/Development/tcpfan
+REPEATS=3 RATE_BPS=10000000 BYTES=16777216 RUN_TIMEOUT_SEC=45 UNDER_RUN_LAG_S=1.000 \
+  RAMP_MODE=binary \
+  SINKS_SERIES="16 32 48 64 96 128 160 192 224 256 320 384 512" \
+  ./benchmark/run_paced_ramp.sh
+```
+
+Outputs:
+
+- `benchmark/results/paced_ramp.csv`
+- `benchmark/results/paced_ramp.md`
+- `benchmark/results/paced_ramp_summary.json`
+
+Spec for cross-agent reproducibility:
+
+- `benchmark/PACED_RAMP_SPEC.md`
+
 ## Notes
 
-- Scenarios are defined in `benchmark/run_all.sh`.
-- Default scenarios:
-  - 64 MiB, 4 sinks
-  - 128 MiB, 8 sinks
-  - 128 MiB, 12 sinks
-- Port allocation is automatic and isolated by scenario/repeat/implementation.
+- Throughput scenarios are defined in `benchmark/run_all.sh`.
+- Paced ramp logic is defined in `benchmark/run_paced_ramp.sh`.
+- Binary search mode assumes sink under-run is monotonic with sink count.
+- Port allocation is automatic and isolated per run.

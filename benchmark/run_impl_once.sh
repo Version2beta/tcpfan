@@ -22,22 +22,35 @@ mkdir -p "$RAW"
 
 make -C "$BENCH" >/dev/null
 
+RUN_TIMEOUT_SEC="${RUN_TIMEOUT_SEC:-0}"
+
+BENCH_MAX_SINKS="${BENCH_MAX_SINKS:-}"
+if [ -n "$BENCH_MAX_SINKS" ]; then
+  MAX_SINKS="$BENCH_MAX_SINKS"
+else
+  MAX_SINKS=64
+  need=$((SINKS + 16))
+  if [ "$need" -gt "$MAX_SINKS" ]; then
+    MAX_SINKS="$need"
+  fi
+fi
+
 case "$IMPL" in
   claude-c)
     BIN="$ROOT/bin/tcpfan-claude-c"
-    ARGS=(--source-port "$SRC_PORT" --sink-port "$SNK_PORT" --max-sinks 4096 --sink-buf 67108864 --stats-interval-ms 0 --log-level normal)
+    ARGS=(--source-port "$SRC_PORT" --sink-port "$SNK_PORT" --max-sinks "$MAX_SINKS" --sink-buf 67108864 --stats-interval-ms 0 --log-level normal)
     ;;
   claude-zig)
     BIN="$ROOT/bin/tcpfan-claude-zig"
-    ARGS=(--source-port "$SRC_PORT" --sink-port "$SNK_PORT" --max-sinks 4096 --sink-buf 67108864 --stats-interval-ms 0 --log-level normal)
+    ARGS=(--source-port "$SRC_PORT" --sink-port "$SNK_PORT" --max-sinks "$MAX_SINKS" --sink-buf 67108864 --stats-interval-ms 0 --log-level normal)
     ;;
   codex-c)
     BIN="$ROOT/bin/tcpfan-codex-c"
-    ARGS=(--source-bind 127.0.0.1 --source-port "$SRC_PORT" --sink-bind 127.0.0.1 --sink-port "$SNK_PORT" --max-sinks 4096 --sink-pending-bytes 67108864 --stats-interval-ms 0 --poll-timeout-ms 50 --log-level normal)
+    ARGS=(--source-bind 127.0.0.1 --source-port "$SRC_PORT" --sink-bind 127.0.0.1 --sink-port "$SNK_PORT" --max-sinks "$MAX_SINKS" --sink-pending-bytes 67108864 --stats-interval-ms 0 --poll-timeout-ms 50 --log-level normal)
     ;;
   codex-zig)
     BIN="$ROOT/bin/tcpfan-codex-zig"
-    ARGS=(--source-bind 127.0.0.1 --source-port "$SRC_PORT" --sink-bind 127.0.0.1 --sink-port "$SNK_PORT" --max-sinks 4096 --sink-pending-max 67108864 --stats-interval-ms 0 --poll-timeout-ms 50 --close-sinks-on-session-end true --log-level normal)
+    ARGS=(--source-bind 127.0.0.1 --source-port "$SRC_PORT" --sink-bind 127.0.0.1 --sink-port "$SNK_PORT" --max-sinks "$MAX_SINKS" --sink-pending-max 67108864 --stats-interval-ms 0 --poll-timeout-ms 50 --close-sinks-on-session-end true --log-level normal)
     ;;
   *)
     echo "unknown impl: $IMPL" >&2
@@ -105,12 +118,65 @@ done
 
 sleep 0.25
 RC=0
-if ! "$BENCH/source_writer" 127.0.0.1 "$SRC_PORT" "$BYTES" 2>"$LOG_SRC"; then
+TIMEOUT_HIT=0
+SOURCE_ARGS=(127.0.0.1 "$SRC_PORT" "$BYTES")
+SOURCE_RATE_BPS="${SOURCE_RATE_BPS:-}"
+if [ -n "$SOURCE_RATE_BPS" ]; then
+  SOURCE_ARGS+=(--rate-bps "$SOURCE_RATE_BPS")
+fi
+"$BENCH/source_writer" "${SOURCE_ARGS[@]}" 2>"$LOG_SRC" &
+SOURCE_PID=$!
+
+if [ "$RUN_TIMEOUT_SEC" -gt 0 ]; then
+  deadline=$((SECONDS + RUN_TIMEOUT_SEC))
+  while :; do
+    source_alive=0
+    sinks_alive=0
+
+    if kill -0 "$SOURCE_PID" >/dev/null 2>&1; then
+      source_alive=1
+    fi
+
+    for pid in "${SINK_PIDS[@]}"; do
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        sinks_alive=1
+        break
+      fi
+    done
+
+    if [ "$source_alive" -eq 0 ] && [ "$sinks_alive" -eq 0 ]; then
+      break
+    fi
+
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      TIMEOUT_HIT=1
+      RC=1
+      break
+    fi
+
+    sleep 0.05
+  done
+fi
+
+if [ "$TIMEOUT_HIT" -eq 1 ]; then
+  echo "run_timeout=1" >>"$LOG_SRC"
+  kill -TERM "$SOURCE_PID" >/dev/null 2>&1 || true
+  for pid in "${SINK_PIDS[@]}"; do
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+  sleep 0.1
+  kill -KILL "$SOURCE_PID" >/dev/null 2>&1 || true
+  for pid in "${SINK_PIDS[@]}"; do
+    kill -KILL "$pid" >/dev/null 2>&1 || true
+  done
+fi
+
+if ! wait "$SOURCE_PID" >/dev/null 2>/dev/null; then
   RC=1
 fi
 
 for pid in "${SINK_PIDS[@]}"; do
-  if ! wait "$pid"; then
+  if ! wait "$pid" >/dev/null 2>/dev/null; then
     RC=1
   fi
 done

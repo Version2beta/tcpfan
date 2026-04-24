@@ -1,7 +1,7 @@
-/* source_writer: connect to host:port and push N bytes of deterministic data,
- * printing a sha256 of the stream to stderr at the end.
+/* source_writer: connect to host:port and push N bytes of deterministic data.
+ * Optional pacing can enforce an average source bit-rate.
  *
- * Usage: source_writer HOST PORT BYTES
+ * Usage: source_writer HOST PORT BYTES [--rate-bps BITS_PER_SEC]
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -26,10 +26,26 @@ static uint64_t xs_next(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr, "usage: %s HOST PORT BYTES\n", argv[0]); return 2; }
+    if (!(argc == 4 || argc == 6)) {
+        fprintf(stderr, "usage: %s HOST PORT BYTES [--rate-bps BITS_PER_SEC]\n", argv[0]);
+        return 2;
+    }
     const char *host = argv[1];
     int port = atoi(argv[2]);
     long long total = atoll(argv[3]);
+    unsigned long long rate_bps = 0;
+
+    if (argc == 6) {
+        if (strcmp(argv[4], "--rate-bps") != 0) {
+            fprintf(stderr, "unknown option: %s\n", argv[4]);
+            return 2;
+        }
+        rate_bps = strtoull(argv[5], NULL, 10);
+        if (rate_bps == 0) {
+            fprintf(stderr, "invalid --rate-bps: %s\n", argv[5]);
+            return 2;
+        }
+    }
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -67,6 +83,23 @@ int main(int argc, char **argv) {
             off += w;
         }
         sent += want;
+
+        if (rate_bps > 0) {
+            double target_sec = (double)(sent * 8.0) / (double)rate_bps;
+            for (;;) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                double elapsed = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec) / 1e9;
+                double sleep_s = target_sec - elapsed;
+                if (sleep_s <= 0.0) break;
+                if (sleep_s > 0.050) sleep_s = 0.050;
+
+                struct timespec ts;
+                ts.tv_sec = (time_t)sleep_s;
+                ts.tv_nsec = (long)((sleep_s - (double)ts.tv_sec) * 1e9);
+                nanosleep(&ts, NULL);
+            }
+        }
     }
 
     /* Half-close write side so relay sees EOF. */
